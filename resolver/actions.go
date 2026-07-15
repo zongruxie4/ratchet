@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,9 @@ var (
 	ActionsBaseURL   = os.Getenv("ACTIONS_BASE_URL")
 	ActionsToken     = coalesce(os.Getenv("ACTIONS_TOKEN"), os.Getenv("GITHUB_TOKEN"))
 	ActionsUploadURL = os.Getenv("ACTIONS_UPLOAD_URL")
+
+	actionVersionRegex         = regexp.MustCompile(`^v\d+(\.\d+)*$`)
+	embeddedActionVersionRegex = regexp.MustCompile(`(^|[^A-Za-z0-9])(v\d+(\.\d+)*)([^A-Za-z0-9]|$)`)
 )
 
 func NormalizeActionsRef(in string) string {
@@ -107,18 +112,86 @@ func (g *Actions) LatestVersion(ctx context.Context, value string) (string, erro
 	if path != "" {
 		name = name + "/" + path
 	}
-	version := *release.TagName
-	if strings.HasPrefix(ref, "v") {
-		refPrecision := strings.Count(githubRef.ref, ".")
-		for strings.Count(version, ".") < refPrecision {
-			version += ".0"
+	version := versionWithPrecision(*release.TagName, ref)
+
+	if strings.HasPrefix(ref, "v") && !isActionVersionTag(version) {
+		version, err = g.selectActionVersion(ctx, owner, repo, version, ref)
+		if err != nil {
+			return "", err
 		}
-		versionParts := strings.Split(version, ".")
-		version = strings.Join(versionParts[:refPrecision+1], ".")
 	}
 
 	result := fmt.Sprintf("%s@%s", name, version)
 	return result, nil
+}
+
+func (g *Actions) selectActionVersion(ctx context.Context, owner, repo, releaseVersion, ref string) (string, error) {
+	ok, err := g.refExists(ctx, owner, repo, releaseVersion)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch latest release ref %s: %w", releaseVersion, err)
+	}
+
+	shouldFallback := !ok
+	majorMismatch := mismatchedActionMajor(releaseVersion, ref)
+	fallbackVersion := ""
+	if shouldFallback || majorMismatch {
+		tags, err := g.listVersionTags(ctx, owner, repo)
+		if err != nil {
+			return "", fmt.Errorf("failed to list tags: %w", err)
+		}
+		fallbackVersion = highestVersionTag(tags)
+	}
+
+	if ok && majorMismatch {
+		if compareActionVersions(releaseVersion, ref) <= 0 && compareActionVersions(fallbackVersion, ref) <= 0 {
+			return ref, nil
+		}
+		shouldFallback = compareActionVersions(fallbackVersion, releaseVersion) > 0
+	}
+	if !shouldFallback {
+		return releaseVersion, nil
+	}
+	if fallbackVersion == "" {
+		// No tags match the reference format - do not upgrade.
+		return ref, nil
+	}
+
+	trimmed := versionWithPrecision(fallbackVersion, ref)
+	if trimmed == fallbackVersion {
+		return fallbackVersion, nil
+	}
+	ok, err = g.refExists(ctx, owner, repo, trimmed)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch fallback ref %s: %w", trimmed, err)
+	}
+	if ok {
+		return trimmed, nil
+	}
+	return fallbackVersion, nil
+}
+
+func versionWithPrecision(version, ref string) string {
+	if !strings.HasPrefix(ref, "v") {
+		return version
+	}
+
+	refPrecision := strings.Count(ref, ".")
+	for strings.Count(version, ".") < refPrecision {
+		version += ".0"
+	}
+	versionParts := strings.Split(version, ".")
+	return strings.Join(versionParts[:refPrecision+1], ".")
+}
+
+func (g *Actions) refExists(ctx context.Context, owner, repo, ref string) (bool, error) {
+	_, resp, err := g.client.Git.GetRef(ctx, owner, repo, "tags/"+ref)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func ParseActionRef(s string) (*GitHubRef, error) {
@@ -155,6 +228,109 @@ type GitHubRef struct {
 	repo  string
 	path  string
 	ref   string
+}
+
+// listVersionTags returns all "v"-prefixed tag names, following pagination.
+func (g *Actions) listVersionTags(ctx context.Context, owner, repo string) ([]string, error) {
+	var tags []string
+	opts := &github.ReferenceListOptions{
+		Ref:         "tags/v",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	for {
+		refs, resp, err := g.client.Git.ListMatchingRefs(ctx, owner, repo, opts)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range refs {
+			tags = append(tags, strings.TrimPrefix(r.GetRef(), "refs/tags/"))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return tags, nil
+}
+
+// highestVersionTag returns the highest action-style version tag.
+func highestVersionTag(tags []string) string {
+	best := ""
+	var bestParts []int
+	for _, tag := range tags {
+		if !isActionVersionTag(tag) {
+			continue
+		}
+		parts := versionParts(tag)
+		cmp := compareVersionParts(parts, bestParts)
+		if best == "" || cmp > 0 || (cmp == 0 && len(parts) > len(bestParts)) {
+			best = tag
+			bestParts = parts
+		}
+	}
+	return best
+}
+
+func isActionVersionTag(tag string) bool {
+	return actionVersionRegex.MatchString(tag)
+}
+
+func mismatchedActionMajor(version, ref string) bool {
+	versionMajor := actionVersionMajor(version)
+	refMajor := actionVersionMajor(ref)
+	return versionMajor != "" && refMajor != "" && versionMajor != refMajor
+}
+
+func actionVersionMajor(version string) string {
+	parts := versionParts(embeddedActionVersion(version))
+	if len(parts) > 0 {
+		return fmt.Sprintf("v%d", parts[0])
+	}
+	return ""
+}
+
+func embeddedActionVersion(version string) string {
+	match := embeddedActionVersionRegex.FindStringSubmatch(version)
+	if match == nil {
+		return ""
+	}
+	return match[2]
+}
+
+func compareActionVersions(a, b string) int {
+	return compareVersionParts(versionParts(embeddedActionVersion(a)), versionParts(embeddedActionVersion(b)))
+}
+
+func versionParts(tag string) []int {
+	segments := strings.Split(strings.TrimPrefix(tag, "v"), ".")
+	parts := make([]int, 0, len(segments))
+	for _, s := range segments {
+		i, err := strconv.Atoi(s)
+		if err != nil {
+			return nil
+		}
+		parts = append(parts, i)
+	}
+	return parts
+}
+
+func compareVersionParts(a, b []int) int {
+	for i := 0; i < len(a) || i < len(b); i++ {
+		av, bv := 0, 0
+		if i < len(a) {
+			av = a[i]
+		}
+		if i < len(b) {
+			bv = b[i]
+		}
+		switch {
+		case av > bv:
+			return 1
+		case av < bv:
+			return -1
+		}
+	}
+	return 0
 }
 
 func coalesce(s ...string) string {
